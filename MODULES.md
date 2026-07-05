@@ -154,11 +154,61 @@ rate-limit vs error permanen.
 
 ## Sisa dari evaluasi awal (belum dikerjakan)
 
-- **Poin 2 — proxy API key:** butuh keputusan platform (Cloudflare Workers/Vercel/
-  Netlify Functions) sebelum eksekusi, karena mengubah cara hosting dari GitHub
-  Pages statis murni.
 - **Poin 4 — caching penuh `computeEngine` antar-cycle:** rolling window sudah
   O(n), tapi seluruh `computeEngine` masih dihitung ulang dari awal tiap cycle.
   Perlu desain state machine terpisah (lihat catatan risiko di atas).
 - **Poin 5 — unit test formal (Vitest):** modul-modul pure (`indicators.js`,
   `engine.js`, `self-learning.js`) sekarang siap ditest tanpa mocking browser.
+
+## Update: API key dipindah ke proxy/backend (poin 2, sudah dikerjakan)
+
+**Baru:** `worker/index.js` — Cloudflare Worker yang jadi satu-satunya pihak yang
+tahu API key asli. Key disimpan sebagai *secret* terenkripsi
+(`wrangler secret put TWELVEDATA_API_KEYS`), TIDAK PERNAH ada di source code
+yang dikirim ke browser. Panduan deploy lengkap: `worker/README-worker.md`.
+
+Rotasi antar-key (yang dulu di client, `fetchWithKeyRotation`) sekarang
+sepenuhnya berjalan di server: Worker mencoba tiap key di pool secara
+berurutan, cuma pindah key kalau memang rate-limit (429/quota) — persis
+logika yang sama, cuma pindah tempat. Opsional: index key terakhir yang
+terbukti jalan bisa disimpan lintas-request via Workers KV (lihat komentar di
+`wrangler.toml`) — tanpa KV pun tetap 100% berfungsi.
+
+**Client (`js/api-client.js`, ditulis ulang):** sekarang cuma memanggil
+`{PROXY_BASE_URL}/api/candles?...` — tidak pernah menyentuh API key Twelve
+Data lagi. `js/api-key-pool.js` (5 key bawaan) **dihapus sepenuhnya** dari
+client. `state.apiKeyIndex`/`apiKeyPoolSize` juga dihapus (tidak relevan lagi
+karena rotasi bukan urusan client). `state.apiKey` sekarang murni untuk fitur
+opsional "key pribadi" — kalau diisi, dikirim ke Worker **milik sendiri**
+sebagai query param, BUKAN ke Twelve Data langsung, dan Worker akan memakainya
+menggantikan pool server untuk request itu.
+
+**File baru:** `js/proxy-config.js` — satu baris `PROXY_BASE_URL` yang WAJIB
+diisi user setelah deploy Worker-nya (lihat `worker/README-worker.md` langkah
+5). Ini satu-satunya perubahan manual yang diperlukan di sisi client.
+
+**UI (`js/main.js`):** status "Key N/M aktif" (yang menyiratkan index pool
+client-side) diganti jadi status mode saja — "Pakai proxy server" atau "Pakai
+key pribadi" — karena client memang tidak lagi tahu key mana yang dipakai di
+server.
+
+**Sudah diverifikasi** (Node, bukan cuma dibaca kodenya):
+1. Worker diuji 7 skenario langsung lewat handler `fetch()`-nya (dengan
+   `fetch` upstream di-mock): sukses langsung, rotasi otomatis saat 2 key
+   pertama kena limit, semua key habis → 429 dengan pesan gabungan, error
+   permanen → langsung gagal TANPA mencoba key lain, key pribadi melewati pool
+   server, env kosong → pesan error jelas, CORS preflight.
+2. Client (`fetchCandles`) diuji dengan `fetch` di-mock: URL yang dipanggil
+   TIDAK PERNAH mengandung `apikey=` di mode default, dan TIDAK PERNAH memanggil
+   `api.twelvedata.com` langsung (selalu lewat `PROXY_BASE_URL`) — sekaligus
+   memverifikasi bahwa opsi key pribadi tetap terkirim dengan benar saat diisi.
+3. Regresi penuh: `computeEngine()` end-to-end masih jalan normal setelah
+   seluruh perubahan ini (tidak ada bagian engine yang tersentuh).
+4. Sweep `grep` di seluruh `js/` — dipastikan nol key literal atau referensi ke
+   pool/index lama yang tersisa.
+
+**Konsekuensi yang perlu diketahui:** aplikasi sekarang butuh Worker yang
+sudah di-deploy dan `PROXY_BASE_URL` yang benar supaya bisa fetch data live —
+kalau belum deploy, `runCycle` akan gagal dengan pesan yang mengarahkan ke
+pengecekan `js/proxy-config.js` (mode CSV tetap berfungsi tanpa proxy sama
+sekali, karena tidak butuh network).

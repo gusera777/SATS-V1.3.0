@@ -10,11 +10,10 @@
    ═══════════════════════════════════════════════════════════ */
 import { state, getLastResult, setLastResult } from './state.js';
 import { CONST } from './constants.js';
-import { API_KEY_POOL, DEFAULT_API_KEY } from './api-key-pool.js';
 import { clamp, presetParams, tfToMinutes } from './utils.js';
 import { computeTrendWeights } from './self-learning.js';
 import { computeEngine } from './engine.js';
-import { fetchCandles, parseCsv, getApiKeyPool, loadApiKeyIndex } from './api-client.js';
+import { fetchCandles, parseCsv } from './api-client.js';
 import {
   persistedHistory, persistedSkipped,
   loadPersistedHistory, loadPersistedSkipped,
@@ -42,16 +41,14 @@ async function runCycle(){
     setStatus('');
   }catch(err){
     setConn('err','Error');
-    // Pesan hint disesuaikan dengan jenis error, supaya pengguna tahu apa yang sebaiknya
-    // dilakukan: timeout/network (sudah di-retry otomatis 3x sebelum sampai ke sini,
-    // lihat withRetry di api-client.js) beda saran dari rate-limit (semua key habis)
-    // atau error permanen (symbol/parameter salah).
-    let hint = ' — cek API key, atau pakai mode CSV di Pengaturan.';
-    if(err.allKeysExhausted) hint = '';
-    else if(err.isTransient) hint = ' — koneksi ke Twelve Data bermasalah (sudah dicoba ulang otomatis). Cek internet Anda, atau pakai mode CSV.';
+    // Rotasi key/rate-limit sekarang murni ditangani server-side oleh proxy Worker
+    // (lihat worker/index.js) — dari sisi client, error yang sampai ke sini cuma
+    // berupa: transient (koneksi ke proxy, sudah di-retry otomatis via withRetry),
+    // atau pesan apa adanya dari proxy (mis. "semua key server kena limit").
+    let hint = ' — cek koneksi, atau pakai mode CSV di Pengaturan.';
+    if(err.isTransient) hint = ' — koneksi ke proxy server bermasalah (sudah dicoba ulang otomatis). Cek internet Anda, atau pakai mode CSV.';
     setStatus('Fetch gagal: '+err.message+hint, 'err');
   }
-  updateApiKeyStatusUI(); // refresh tampilan index/pool — auto-switch mungkin baru saja pindah key
 }
 
 function processAndRender(candles){
@@ -137,39 +134,35 @@ const LS_KEY = 'gusera_sats_api_key';
 function persistApiKey(){
   try{
     if(state.apiKey) localStorage.setItem(LS_KEY, state.apiKey);
-    else localStorage.removeItem(LS_KEY); // key pribadi dikosongkan -> kembali murni ke pool bawaan
+    else localStorage.removeItem(LS_KEY); // key pribadi dikosongkan -> proxy pakai pool server-nya sendiri
   }catch(e){ /* Safari private mode / storage disabled — ignore */ }
 }
 function restoreApiKey(){
   let saved = null;
   try{ saved = localStorage.getItem(LS_KEY); }catch(e){}
-  const key = saved || DEFAULT_API_KEY;
+  const key = saved || '';
   document.getElementById('apiKeyInput').value = key;
   state.apiKey = key;
-  loadApiKeyIndex();
   updateApiKeyStatusUI();
 }
 
-/* Menampilkan key mana yang sedang aktif (index/ukuran pool) di modal Pengaturan
-   & tab Profil, supaya auto-switch tidak jadi kotak-hitam — pengguna bisa lihat
-   kalau, misal, key ke-3 dari 5 yang sedang dipakai karena 2 sebelumnya kena limit. */
+/* Dulu menampilkan index/ukuran pool (auto-switch key ditangani di client). Sekarang
+   rotasi key sepenuhnya server-side di proxy Worker (lihat worker/index.js) — client
+   tidak lagi tahu maupun perlu tahu key mana yang sedang dipakai di server, jadi
+   statusnya disederhanakan jadi "mode" saja: pakai key pribadi, atau pakai proxy. */
 function updateApiKeyStatusUI(){
-  const pool = getApiKeyPool();
-  const idx = clamp(state.apiKeyIndex, 0, pool.length-1);
-  const hasCustom = pool.length > API_KEY_POOL.length;
-  const label = hasCustom
-    ? `Key ${idx+1}/${pool.length} aktif (${idx===0?'pribadi':'bawaan #'+idx} · auto-switch)`
-    : `Key ${idx+1}/${pool.length} aktif (bawaan · auto-switch)`;
+  const usingCustom = !!(state.apiKey && state.apiKey.trim());
+  const label = usingCustom ? 'Pakai API key pribadi (langsung, tanpa pool server)' : 'Pakai proxy server (key aman, auto-switch di server)';
   const modalEl = document.getElementById('apiKeyPoolStatus');
   if(modalEl) modalEl.textContent = label;
   const profEl = document.getElementById('profApiKeyStatus');
-  if(profEl) profEl.textContent = `${idx+1}/${pool.length}`;
+  if(profEl) profEl.textContent = usingCustom ? 'Key pribadi' : 'Proxy server';
 }
 
 document.getElementById('saveStartBtn').onclick = async ()=>{
   collectSettingsFromForm();
-  // Tidak lagi memblokir kalau apiKeyInput kosong — pool 5 key bawaan (API_KEY_POOL)
-  // selalu tersedia sebagai fallback auto-switch, jadi key pribadi kini benar-benar opsional.
+  // Tidak lagi memblokir kalau apiKeyInput kosong — proxy server selalu tersedia sebagai
+  // fallback (lihat worker/index.js), jadi key pribadi kini benar-benar opsional.
   persistApiKey();
   updateApiKeyStatusUI();
   setModalStatus('Pengaturan disimpan.', 'ok');
@@ -197,8 +190,8 @@ document.getElementById('csvLoadBtn').onclick = ()=>{
 
 document.getElementById('startBtn').onclick = async ()=>{
   collectSettingsFromForm();
-  // Tidak lagi memblokir kalau apiKeyInput kosong — pool 5 key bawaan (API_KEY_POOL)
-  // selalu tersedia sebagai fallback auto-switch (lihat fetchWithKeyRotation).
+  // Tidak lagi memblokir kalau apiKeyInput kosong — proxy server selalu tersedia sebagai
+  // fallback dengan auto-switch key di sisi server (lihat worker/index.js).
   if(state.notif && 'Notification' in window){
     try{ const p = await Notification.requestPermission(); state.notifPermission = p==='granted'; }catch(e){}
   }

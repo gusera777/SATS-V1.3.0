@@ -2,10 +2,10 @@
    RETRY DENGAN EXPONENTIAL BACKOFF
    ─────────────────────────────────────────────────────────
    Dipakai khusus untuk error TRANSIENT (network putus, timeout, HTTP 5xx) —
-   BUKAN untuk rate-limit/quota (itu sudah ditangani terpisah oleh
-   fetchWithKeyRotation di api-client.js lewat auto-switch key) dan BUKAN untuk
-   error permanen (symbol salah, format data tidak dikenal, dll — mengulang
-   error semacam itu cuma buang waktu karena hasilnya pasti sama).
+   BUKAN untuk rate-limit/quota (kini sepenuhnya ditangani server-side oleh
+   proxy Worker, lihat worker/index.js) dan BUKAN untuk error permanen (symbol
+   salah, format data tidak dikenal, dll — mengulang error semacam itu cuma
+   buang waktu karena hasilnya pasti sama).
 
    Sebuah error dianggap transient HANYA kalau eksplisit ditandai
    `err.isTransient = true` oleh pemanggilnya (lihat fetchCandlesRaw) — retry

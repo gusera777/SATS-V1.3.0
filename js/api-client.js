@@ -1,11 +1,18 @@
-import { clamp } from './utils.js';
 import { state } from './state.js';
-import { API_KEY_POOL } from './api-key-pool.js';
 import { withRetry } from './retry.js';
+import { PROXY_BASE_URL } from './proxy-config.js';
 
 /* ═══════════════════════════════════════════════════════════
-   DATA FETCH
+   DATA FETCH — lewat proxy Worker (lihat worker/index.js)
+   ─────────────────────────────────────────────────────────
+   API key TIDAK PERNAH ada di bundle client lagi. Rotasi antar-key sekarang
+   ditangani server-side oleh Worker (lihat komentar di sana) — client cukup
+   memanggil satu endpoint dan tidak perlu tahu apa-apa soal pool key.
+   Kalau user mengisi API key PRIBADI di ⚙ Pengaturan, dikirim sebagai query
+   param `apikey` ke Worker milik sendiri (bukan ke Twelve Data langsung) —
+   Worker yang akan memakainya menggantikan pool server untuk request itu.
    ═══════════════════════════════════════════════════════════ */
+
 /* A candle row is only usable if OHLC are finite numbers, all positive,
    and high/low actually bound open & close. Volume is optional (defaults
    to 0 for pairs with no volume data) but must be a finite, non-negative
@@ -25,12 +32,13 @@ export function isValidCandleRow(c){
 
 const FETCH_TIMEOUT_MS = 15000;
 
-export async function fetchCandlesRaw(symbol, interval, outputSize, apiKey){
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${outputSize}&apikey=${encodeURIComponent(apiKey)}`;
+export async function fetchCandlesRaw(symbol, interval, outputSize, customApiKey){
+  const params = new URLSearchParams({ symbol, interval, outputsize: String(outputSize) });
+  if(customApiKey) params.set('apikey', customApiKey); // opsional, lihat komentar di atas
+  const url = `${PROXY_BASE_URL}/api/candles?${params.toString()}`;
 
-  // Timeout eksplisit: tanpa ini, koneksi yang lambat/menggantung bisa membuat satu
-  // cycle refresh macet tanpa batas waktu (lihat evaluasi poin 3 — tidak ada
-  // AbortController/timeout sebelumnya).
+  // Timeout eksplisit — sama seperti sebelumnya, cuma sekarang untuk koneksi ke
+  // Worker milik sendiri, bukan langsung ke Twelve Data.
   const controller = new AbortController();
   const timeoutId = setTimeout(()=> controller.abort(), FETCH_TIMEOUT_MS);
   let res;
@@ -38,39 +46,31 @@ export async function fetchCandlesRaw(symbol, interval, outputSize, apiKey){
     res = await fetch(url, { signal: controller.signal });
   }catch(networkErr){
     clearTimeout(timeoutId);
-    // Network putus, DNS gagal, atau timeout (AbortError) — ini TRANSIENT: kemungkinan
-    // besar akan berhasil kalau dicoba lagi sebentar lagi, jadi ditandai supaya
-    // withRetry() (dipanggil dari fetchWithKeyRotation) mengulanginya dengan backoff,
-    // BUKAN langsung menyerah seperti error permanen (symbol salah, dll).
     const timedOut = networkErr.name==='AbortError';
     const err = new Error(timedOut
-      ? `Request timeout setelah ${FETCH_TIMEOUT_MS/1000} detik.`
-      : `Gagal terhubung ke server Twelve Data (${networkErr.message}).`);
+      ? `Request ke proxy timeout setelah ${FETCH_TIMEOUT_MS/1000} detik.`
+      : `Gagal terhubung ke proxy server (${networkErr.message}). Cek PROXY_BASE_URL di js/proxy-config.js sudah benar & Worker sudah di-deploy.`);
     err.isTransient = true;
     throw err;
   }
   clearTimeout(timeoutId);
 
   if(res.status>=500){
-    // Error server (5xx) — juga transient, beda kelas dari 4xx (rate-limit/quota di
-    // bawah, atau kesalahan permanen seperti symbol/parameter salah).
-    const err = new Error(`Server Twelve Data bermasalah (HTTP ${res.status}).`);
+    // 502/504 dari Worker berarti Twelve Data sendiri yang bermasalah (lihat
+    // worker/index.js) — transient, layak di-retry oleh withRetry.
+    const err = new Error(`Proxy/Twelve Data bermasalah (HTTP ${res.status}).`);
     err.isTransient = true;
     throw err;
   }
 
   const json = await res.json();
-  if(json.status==='error' || json.code){
-    const msg = json.message || 'API error';
-    const err = new Error(msg);
-    // Ditandai sebagai rate-limit hanya kalau memang soal limit/quota/HTTP 429 — error lain
-    // (symbol salah, interval tidak didukung, dll) TIDAK ditandai, supaya fetchWithKeyRotation
-    // di bawah tidak buang-buang percobaan pindah key untuk error yang tidak akan pernah
-    // hilang dengan key manapun.
-    err.isRateLimit = res.status===429 || json.code===429 || /credit|limit|too many request/i.test(msg);
-    throw err;
+  if(json.error){
+    // 429 dari Worker berarti SEMUA key server sudah kena limit — bukan sesuatu
+    // yang bisa diperbaiki dengan retry di sisi client, jadi tidak ditandai
+    // transient (rotasi key sekarang murni urusan server, lihat worker/index.js).
+    throw new Error(json.error);
   }
-  if(!json.values) throw new Error('Format data tidak dikenal dari API.');
+  if(!json.values) throw new Error('Format data tidak dikenal dari proxy.');
   const rawCount = json.values.length;
   const candles = json.values.map(v=>{
     const vol = parseFloat(v.volume||0);
@@ -83,66 +83,16 @@ export async function fetchCandlesRaw(symbol, interval, outputSize, apiKey){
   return candles;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   AUTO-SWITCH API KEY (pool bawaan + key pribadi opsional)
-   ─────────────────────────────────────────────────────────
-   Key pribadi (kalau diisi di ⚙ Pengaturan) selalu jadi kandidat PERTAMA, diikuti
-   5 key bawaan (API_KEY_POOL). apiKeyIndex menunjuk key yang TERAKHIR TERBUKTI
-   jalan, disimpan lintas sesi (localStorage) supaya reload berikutnya tidak
-   mengulang dari key yang sudah diketahui kena limit. */
-export function getApiKeyPool(){
-  const custom = (state.apiKey||'').trim();
-  const pool = API_KEY_POOL.slice();
-  if(custom && !pool.includes(custom)) pool.unshift(custom);
-  return pool;
-}
-const LS_KEY_INDEX = 'gusera_sats_api_key_index';
-export function loadApiKeyIndex(){
-  let v = 0;
-  try{ v = parseInt(localStorage.getItem(LS_KEY_INDEX),10); }catch(e){}
-  state.apiKeyIndex = (isFinite(v) && v>=0) ? v : 0;
-}
-export function saveApiKeyIndex(){
-  try{ localStorage.setItem(LS_KEY_INDEX, String(state.apiKeyIndex)); }catch(e){}
-}
-
-/* Mencoba tiap key di pool secara berurutan, mulai dari apiKeyIndex terakhir yang
-   terbukti jalan. HANYA pindah ke key berikutnya kalau errornya isRateLimit===true
-   (limit/quota) — error lain langsung dilempar apa adanya (mengganti key tidak akan
-   memperbaiki symbol salah atau format tidak dikenal, jadi tidak perlu 5x percobaan
-   yang sama-sama pasti gagal). Kalau SEMUA key di pool kena limit, error terakhir
-   dilempar dengan pesan gabungan yang jelas. */
-export async function fetchWithKeyRotation(fetchFn){
-  const pool = getApiKeyPool();
-  let idx = clamp(state.apiKeyIndex, 0, pool.length-1);
-  let lastErr = null;
-  for(let attempt=0; attempt<pool.length; attempt++){
-    try{
-      // withRetry menangani error TRANSIENT (network/timeout/5xx, lihat fetchCandlesRaw)
-      // dengan 3x percobaan + exponential backoff PADA KEY YANG SAMA sebelum menyerah —
-      // masuk akal karena gangguan network biasanya bukan soal key mana yang dipakai.
-      // Error rate-limit/permanen tidak disentuh withRetry sama sekali (langsung throw),
-      // ditangani oleh logic rotasi key di bawah seperti sebelumnya.
-      const result = await withRetry(()=>fetchFn(pool[idx]), {retries:3, baseDelayMs:500});
-      if(state.apiKeyIndex !== idx){ state.apiKeyIndex = idx; saveApiKeyIndex(); }
-      state.apiKeyPoolSize = pool.length; // dipakai UI untuk menampilkan "N/M"
-      return result;
-    }catch(e){
-      lastErr = e;
-      if(!e.isRateLimit) throw e;
-      idx = (idx+1) % pool.length;
-    }
-  }
-  state.apiKeyIndex = idx; saveApiKeyIndex();
-  state.apiKeyPoolSize = pool.length;
-  const err = new Error(`Semua ${pool.length} API key kena limit/quota. Coba lagi nanti, isi key pribadi Anda sendiri, atau pakai Mode CSV. (Pesan terakhir: ${lastErr?lastErr.message:'-'})`);
-  err.allKeysExhausted = true;
-  throw err;
-}
-
 export async function fetchCandles(){
-  return fetchWithKeyRotation(key => fetchCandlesRaw(state.symbol, state.interval, state.outputSize, key));
+  // withRetry menangani gangguan TRANSIENT (network ke Worker/timeout/5xx) dengan
+  // backoff — terpisah dari urusan rate-limit/rotasi key yang kini sepenuhnya
+  // ditangani server-side dalam satu panggilan Worker (lihat worker/index.js).
+  return withRetry(
+    () => fetchCandlesRaw(state.symbol, state.interval, state.outputSize, state.apiKey),
+    { retries: 3, baseDelayMs: 500 }
+  );
 }
+
 export function parseCsv(text){
   const lines = text.trim().split('\n').map(l=>l.trim()).filter(Boolean);
   const candles = [];
