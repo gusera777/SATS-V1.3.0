@@ -10,7 +10,7 @@ compatibility_date = "2026-01-01"
 #
 # [[kv_namespaces]]
 # binding = "KEY_INDEX_KV"
-# id = "fcb25b1365ae4161a800865700059b82"
+# id = "ISI_DENGAN_ID_DARI_WRANGLER"
 
 # ── Opsional: batasi CORS hanya ke domain GitHub Pages Anda (default "*" kalau
 # tidak diisi — aman karena data yang dikembalikan bukan data sensitif per-user).
