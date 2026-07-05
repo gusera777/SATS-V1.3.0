@@ -80,7 +80,43 @@ kena masalah CORS `file://` ini).
    `setLastResult()` (diinventarisir manual, bukan cuma dipercaya begitu saja) dan
    komentar dokumentasi baru.
 
-## Yang BELUM disentuh (di luar scope langkah ini)
+## Update: Optimasi incremental — rolling window (poin 4, versi aman, sudah dikerjakan)
+
+`js/indicators.js` — `rollingHighest`/`rollingLowest` diganti dari brute-force
+`Math.max(...arr.slice(...))` per elemen (**O(n·len)**) jadi **sliding-window
+monotonic deque (O(n) total)**. Ini fungsi yang paling jelas boros di
+`computeEngine` — dipanggil setiap cycle refresh untuk cari support/resistance
+window, padahal biasanya cuma 1 candle baru yang masuk.
+
+Semantik output **identik 100%** dengan versi lama (window `[max(0,i-len+1), i]`
+inklusif) — bukan sekadar diasumsikan, tapi diverifikasi brute-force terhadap
+implementasi lama di 56 kombinasi ukuran-array × panjang-window, plus edge case
+array kosong dan array isi sama semua (tie).
+
+**Benchmark (Node, sebelum vs sesudah):**
+
+| n (jumlah candle) | len (window) | Sebelum | Sesudah | Speedup |
+|---|---|---|---|---|
+| 300 | 50 | 12.2 ms /50x-run | 4.2 ms | 2.9× |
+| 300 | 200 | 23.8 ms /50x-run | 0.2 ms | **113.6×** |
+| 2000 | 200 | 180.2 ms /50x-run | 1.0 ms | **173.1×** |
+| 5000 | 500 | 1241.6 ms /50x-run | 4.2 ms | **292.9×** |
+
+Speedup membesar drastis seiring window makin lebar — persis sesuai prediksi
+O(n·len) vs O(n). Untuk `outputSize` default 300 dengan window lookback khas
+(struktur/pivot, biasanya puluhan-ratusan bar), ini bukan lagi pekerjaan yang
+percuma diulang tiap cycle.
+
+**Catatan soal cakupan:** ini BARU rolling window (bagian yang aman & murni
+menang tanpa risiko akurasi). Caching penuh seluruh `computeEngine` antar-cycle
+(supaya cuma bar baru yang dihitung, bukan seluruh array dari awal) BELUM
+dikerjakan — itu perlu desain state machine terpisah karena self-learning
+(`computeAdaptiveThreshold`) tidak murni fungsi dari candle terakhir saja,
+sesuai catatan risiko di evaluasi awal.
+
+Diregresi-test: `computeEngine()` end-to-end dengan 300 candle sintetis setelah
+perubahan — hasil tetap masuk akal, tidak ada exception.
+
 
 Sesuai rencana bertahap sebelumnya — modularisasi ini murni pemindahan kode, tanpa
 mengubah perilaku. Poin 2 (proxy API key), poin 4 (incremental computation), dan
@@ -115,3 +151,14 @@ rate-limit vs error permanen.
    di key yang sama (tidak percuma rotasi), error rate-limit tetap rotasi ke key
    berikutnya seperti semula.
 
+
+## Sisa dari evaluasi awal (belum dikerjakan)
+
+- **Poin 2 — proxy API key:** butuh keputusan platform (Cloudflare Workers/Vercel/
+  Netlify Functions) sebelum eksekusi, karena mengubah cara hosting dari GitHub
+  Pages statis murni.
+- **Poin 4 — caching penuh `computeEngine` antar-cycle:** rolling window sudah
+  O(n), tapi seluruh `computeEngine` masih dihitung ulang dari awal tiap cycle.
+  Perlu desain state machine terpisah (lihat catatan risiko di atas).
+- **Poin 5 — unit test formal (Vitest):** modul-modul pure (`indicators.js`,
+  `engine.js`, `self-learning.js`) sekarang siap ditest tanpa mocking browser.

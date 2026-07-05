@@ -69,8 +69,35 @@ export function rsiArr(closes, len){
   function computeRsi(g,l){ if(l===0) return 100; const rs=g/l; return 100-100/(1+rs); }
   return out;
 }
-export function rollingHighest(arr,len){ return arr.map((_,i)=>{ const s=Math.max(0,i-len+1); return Math.max(...arr.slice(s,i+1)); }); }
-export function rollingLowest(arr,len){ return arr.map((_,i)=>{ const s=Math.max(0,i-len+1); return Math.min(...arr.slice(s,i+1)); }); }
+/* Sliding-window max/min lewat monotonic deque — O(n) total, dibanding versi lama
+   yang O(n·len) karena Math.max(...arr.slice(...)) dihitung ulang dari nol untuk
+   SETIAP elemen. Semantiknya identik dengan versi lama (window = [max(0,i-len+1), i],
+   inklusif) — sudah diverifikasi lewat brute-force comparison, lihat riwayat
+   percakapan. Deque menyimpan INDEX (bukan nilai), dijaga monoton menurun (untuk
+   max) / menaik (untuk min) dari depan ke belakang, sehingga elemen terdepan
+   selalu jadi jawaban untuk window saat ini. */
+export function rollingHighest(arr, len){
+  const out = new Array(arr.length);
+  const deque = []; // index, arr[deque[...]] menurun dari depan ke belakang
+  for(let i=0;i<arr.length;i++){
+    while(deque.length && arr[deque[deque.length-1]] <= arr[i]) deque.pop();
+    deque.push(i);
+    if(deque[0] <= i-len) deque.shift();
+    out[i] = arr[deque[0]];
+  }
+  return out;
+}
+export function rollingLowest(arr, len){
+  const out = new Array(arr.length);
+  const deque = []; // index, arr[deque[...]] menaik dari depan ke belakang
+  for(let i=0;i<arr.length;i++){
+    while(deque.length && arr[deque[deque.length-1]] >= arr[i]) deque.pop();
+    deque.push(i);
+    if(deque[0] <= i-len) deque.shift();
+    out[i] = arr[deque[0]];
+  }
+  return out;
+}
 
 export function pivotHighArr(highs, lp){
   const out = new Array(highs.length).fill(null);
