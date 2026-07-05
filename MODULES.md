@@ -83,5 +83,35 @@ kena masalah CORS `file://` ini).
 ## Yang BELUM disentuh (di luar scope langkah ini)
 
 Sesuai rencana bertahap sebelumnya — modularisasi ini murni pemindahan kode, tanpa
-mengubah perilaku. Poin 2 (proxy API key), poin 3 (retry/backoff), poin 4
-(incremental computation), dan poin 5 (unit test framework) masih menunggu giliran.
+mengubah perilaku. Poin 2 (proxy API key), poin 4 (incremental computation), dan
+poin 5 (unit test framework) masih menunggu giliran.
+
+## Update: Error handling & retry (poin 3, sudah dikerjakan)
+
+`js/retry.js` (baru) — `withRetry(fn, {retries, baseDelayMs, maxDelayMs})`: generic
+exponential-backoff+jitter, HANYA mengulang error yang eksplisit ditandai
+`err.isTransient = true` (tidak menebak dari isi pesan error).
+
+`js/api-client.js` — `fetchCandlesRaw`:
+- Ditambah `AbortController` + timeout 15 detik (`FETCH_TIMEOUT_MS`) — sebelumnya
+  fetch bisa menggantung tanpa batas.
+- Network gagal / timeout / HTTP 5xx sekarang ditandai `isTransient=true`.
+- Error rate-limit (429/quota) & error permanen (symbol salah, format tak dikenal)
+  TIDAK ditandai transient — perilakunya persis seperti sebelumnya (rate-limit →
+  rotasi key di `fetchWithKeyRotation`; error permanen → langsung gagal).
+
+`js/api-client.js` — `fetchWithKeyRotation`: setiap percobaan per-key sekarang
+dibungkus `withRetry` (3x percobaan, backoff mulai 500ms) — retry transient terjadi
+DI KEY YANG SAMA dulu sebelum keputusan rotasi/gagal yang sudah ada diambil.
+
+`js/main.js` — `runCycle`: pesan error yang ditampilkan ke UI sekarang membedakan
+transient (menyarankan cek koneksi, catatan "sudah dicoba ulang otomatis") vs
+rate-limit vs error permanen.
+
+**Sudah diverifikasi** (Node, lihat riwayat percakapan untuk skrip lengkapnya):
+1. `withRetry` diuji 3 skenario: transient→sukses (retry jalan), non-transient
+   (tidak diulang sama sekali), transient terus gagal (throw setelah retries habis).
+2. `fetchWithKeyRotation` diuji dengan `fetch` yang di-mock: error transient tetap
+   di key yang sama (tidak percuma rotasi), error rate-limit tetap rotasi ke key
+   berikutnya seperti semula.
+

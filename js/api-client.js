@@ -1,6 +1,7 @@
 import { clamp } from './utils.js';
 import { state } from './state.js';
 import { API_KEY_POOL } from './api-key-pool.js';
+import { withRetry } from './retry.js';
 
 /* ═══════════════════════════════════════════════════════════
    DATA FETCH
@@ -22,9 +23,42 @@ export function isValidCandleRow(c){
   return true;
 }
 
+const FETCH_TIMEOUT_MS = 15000;
+
 export async function fetchCandlesRaw(symbol, interval, outputSize, apiKey){
   const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${outputSize}&apikey=${encodeURIComponent(apiKey)}`;
-  const res = await fetch(url);
+
+  // Timeout eksplisit: tanpa ini, koneksi yang lambat/menggantung bisa membuat satu
+  // cycle refresh macet tanpa batas waktu (lihat evaluasi poin 3 — tidak ada
+  // AbortController/timeout sebelumnya).
+  const controller = new AbortController();
+  const timeoutId = setTimeout(()=> controller.abort(), FETCH_TIMEOUT_MS);
+  let res;
+  try{
+    res = await fetch(url, { signal: controller.signal });
+  }catch(networkErr){
+    clearTimeout(timeoutId);
+    // Network putus, DNS gagal, atau timeout (AbortError) — ini TRANSIENT: kemungkinan
+    // besar akan berhasil kalau dicoba lagi sebentar lagi, jadi ditandai supaya
+    // withRetry() (dipanggil dari fetchWithKeyRotation) mengulanginya dengan backoff,
+    // BUKAN langsung menyerah seperti error permanen (symbol salah, dll).
+    const timedOut = networkErr.name==='AbortError';
+    const err = new Error(timedOut
+      ? `Request timeout setelah ${FETCH_TIMEOUT_MS/1000} detik.`
+      : `Gagal terhubung ke server Twelve Data (${networkErr.message}).`);
+    err.isTransient = true;
+    throw err;
+  }
+  clearTimeout(timeoutId);
+
+  if(res.status>=500){
+    // Error server (5xx) — juga transient, beda kelas dari 4xx (rate-limit/quota di
+    // bawah, atau kesalahan permanen seperti symbol/parameter salah).
+    const err = new Error(`Server Twelve Data bermasalah (HTTP ${res.status}).`);
+    err.isTransient = true;
+    throw err;
+  }
+
   const json = await res.json();
   if(json.status==='error' || json.code){
     const msg = json.message || 'API error';
@@ -84,7 +118,12 @@ export async function fetchWithKeyRotation(fetchFn){
   let lastErr = null;
   for(let attempt=0; attempt<pool.length; attempt++){
     try{
-      const result = await fetchFn(pool[idx]);
+      // withRetry menangani error TRANSIENT (network/timeout/5xx, lihat fetchCandlesRaw)
+      // dengan 3x percobaan + exponential backoff PADA KEY YANG SAMA sebelum menyerah —
+      // masuk akal karena gangguan network biasanya bukan soal key mana yang dipakai.
+      // Error rate-limit/permanen tidak disentuh withRetry sama sekali (langsung throw),
+      // ditangani oleh logic rotasi key di bawah seperti sebelumnya.
+      const result = await withRetry(()=>fetchFn(pool[idx]), {retries:3, baseDelayMs:500});
       if(state.apiKeyIndex !== idx){ state.apiKeyIndex = idx; saveApiKeyIndex(); }
       state.apiKeyPoolSize = pool.length; // dipakai UI untuk menampilkan "N/M"
       return result;

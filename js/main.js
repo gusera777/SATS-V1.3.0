@@ -42,7 +42,13 @@ async function runCycle(){
     setStatus('');
   }catch(err){
     setConn('err','Error');
-    const hint = err.allKeysExhausted ? '' : ' — cek API key, atau pakai mode CSV di Pengaturan.';
+    // Pesan hint disesuaikan dengan jenis error, supaya pengguna tahu apa yang sebaiknya
+    // dilakukan: timeout/network (sudah di-retry otomatis 3x sebelum sampai ke sini,
+    // lihat withRetry di api-client.js) beda saran dari rate-limit (semua key habis)
+    // atau error permanen (symbol/parameter salah).
+    let hint = ' — cek API key, atau pakai mode CSV di Pengaturan.';
+    if(err.allKeysExhausted) hint = '';
+    else if(err.isTransient) hint = ' — koneksi ke Twelve Data bermasalah (sudah dicoba ulang otomatis). Cek internet Anda, atau pakai mode CSV.';
     setStatus('Fetch gagal: '+err.message+hint, 'err');
   }
   updateApiKeyStatusUI(); // refresh tampilan index/pool — auto-switch mungkin baru saja pindah key
